@@ -1,12 +1,7 @@
-# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
-
-# C extensions
 *.so
-
-# Distribution / packaging
 .Python
 build/
 develop-eggs/
@@ -23,19 +18,23 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+MANIFEST
 
 # Virtual environments
 venv/
-.venv/
 ENV/
 env/
+.venv/
 
-# IDE / Editor
+# IDE / Editor configs
 .vscode/
 .idea/
 *.swp
 *.swo
 
-# OS files
+# OS generated
 Thumbs.db
+ehthumbs.db
 Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
