@@ -1,4 +1,4 @@
-# ⚡ BluePulse Auto-Clicker | Intelligent Vision
+# ⚡ BLUE PLUSE TECH | Intelligent Vision
 
 An advanced, beautifully styled desktop auto-clicker built with **Python**, **CustomTkinter**, and **OpenCV**. It visually scans a user-defined screen region and automatically clicks any blue button within that space until paused or stopped.
 
@@ -44,7 +44,18 @@ pip install -r requirements.txt
 
 ## 🎯 How to Run
 
-### 1. Launch the Auto-Clicker
+### 🚀 Standalone App (No Python Needed!)
+Anyone can run the application directly without installing Python, code, or terminal commands:
+- Simply go to the `dist` folder and double-click:
+  **`dist/BLUE PLUSE TECH.exe`**
+- It runs as a normal Windows desktop app right out of the box!
+
+---
+
+### Alternative: Run from Source Code (Python)
+1. Make sure Python 3.10+ is installed.
+2. Install dependencies: `pip install -r requirements.txt`
+3. Launch the app:
 ```bash
 python app.py
 ```

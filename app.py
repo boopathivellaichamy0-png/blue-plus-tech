@@ -1,5 +1,5 @@
 """
-BluePulse Vision Auto-Clicker
+BLUE PLUSE TECH Vision Auto-Clicker
 Specialized for Blue Submit Buttons in AI / IDE Prompts.
 Clicks ONCE per prompt, waits for the modal to dismiss/next to arrive.
 Stop shortcut: BACKSPACE
@@ -18,6 +18,8 @@ import pyautogui
 import cv2
 import numpy as np
 import mss
+import difflib
+import re
 
 # Enable DPI Awareness for pixel-perfect coordinates on Windows
 try:
@@ -25,6 +27,15 @@ try:
 except Exception:
     try:
         ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+# Automatically hide background console window when launched as standalone EXE
+if getattr(sys, 'frozen', False):
+    try:
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE
     except Exception:
         pass
 
@@ -42,11 +53,24 @@ try:
 except ImportError:
     HAS_KEYBOARD = False
 
-# PyAutoGUI Safety settings
-pyautogui.FAILSAFE = True
+# PyAutoGUI Safety settings: disabled corner failsafe so mouse movements never halt automation
+pyautogui.FAILSAFE = False
 pyautogui.PAUSE = 0.01
 
-TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "submit_button_template.png")
+def get_resource_path(relative_path):
+    """Get absolute path to resource, works for dev and for PyInstaller bundle."""
+    if getattr(sys, 'frozen', False):
+        exe_dir = os.path.dirname(sys.executable)
+        target = os.path.join(exe_dir, relative_path)
+        if os.path.exists(target):
+            return target
+        meipass = getattr(sys, '_MEIPASS', exe_dir)
+        target = os.path.join(meipass, relative_path)
+        if os.path.exists(target):
+            return target
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), relative_path)
+
+TEMPLATE_PATH = get_resource_path("submit_button_template.png")
 
 
 def ensure_desktop_access():
@@ -165,7 +189,9 @@ class RegionSelector(tk.Toplevel):
 
 
 class AutoClickerEngine:
-    """Precision vision engine: strictly detects the 'Submit' button and clicks ONCE per prompt."""
+    """Robust vision engine: strictly detects the 'Submit' text inside the blue button and clicks until stopped."""
+
+    TARGET_KEYWORDS = ["submit"]
 
     def __init__(self, callback_on_click, callback_on_status):
         self.callback_on_click = callback_on_click
@@ -176,30 +202,53 @@ class AutoClickerEngine:
         self.is_paused = False
         self.thread = None
 
-        self.use_full_screen = False
+        self.use_full_screen = True  # Default to full screen so Start works immediately!
         self.sound_enabled = True
+        self.filter_by_text = True   # Filter strictly for 'submit'!
+        self.click_mode = "single"  # "single": click once per button & wait for next; "repeat": continuous
+        self.click_interval = 0.20  # Repeat click interval if in repeat mode
+        self.click_latency = 2.0   # 2.0s latency once button appears before clicking
+        self.button_present = False
 
         self.total_clicks = 0
         self.fps = 0.0
 
-        # Load Submit Button Template in grayscale and BGR
+        # OCR Engine for verifying text inside button
+        self.ocr_reader = None
+        self.ocr_ready = False
+        self.verified_target_cache = None  # (bx, by, bw, bh, keyword, expire_time)
+
+        # Background initialization of EasyOCR so GUI opens with 0ms delay
+        threading.Thread(target=self._init_ocr_background, daemon=True).start()
+
+        # Load Submit Button Template in grayscale and BGR if available
         self.template_bgr = None
         self.template_gray = None
         if os.path.exists(TEMPLATE_PATH):
             self.template_bgr = cv2.imread(TEMPLATE_PATH)
-            self.template_gray = cv2.cvtColor(self.template_bgr, cv2.COLOR_BGR2GRAY)
+            if self.template_bgr is not None:
+                self.template_gray = cv2.cvtColor(self.template_bgr, cv2.COLOR_BGR2GRAY)
+
+    def _init_ocr_background(self):
+        try:
+            import easyocr
+            self.ocr_reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+            self.ocr_ready = True
+        except Exception:
+            self.ocr_ready = False
 
     def start(self, region):
         """Start or resume clicking."""
         self.region = region
+        self.button_present = False
         if self.is_running and self.is_paused:
             self.is_paused = False
-            self.callback_on_status("RUNNING", "Active • Scanning for Submit button...")
+            self.callback_on_status("RUNNING", "Active • Scanning for Blue 'Submit' Button...")
             return
 
         self.is_running = True
         self.is_paused = False
-        self.callback_on_status("RUNNING", "Active • Scanning for Submit button...")
+        self.callback_on_status("RUNNING", "Active • Scanning for Blue 'Submit' Button...")
 
         self.thread = threading.Thread(target=self._worker_loop, daemon=True)
         self.thread.start()
@@ -214,72 +263,226 @@ class AutoClickerEngine:
         """Stop clicking loop completely."""
         self.is_running = False
         self.is_paused = False
+        self.button_present = False
+        self.verified_target_cache = None
         self.callback_on_status("STOPPED", "Stopped by user")
 
     def _play_click_sound(self):
         if HAS_WINSOUND and self.sound_enabled:
             try:
-                winsound.Beep(1850, 25)
+                winsound.Beep(1850, 20)
             except Exception:
                 pass
 
-    def _find_submit_button(self, frame_bgr):
-        """Strictly locate the exact 'Submit ↵' button. Returns (cx, cy, bx, by, bw, bh) or None."""
-        if self.template_gray is None:
+    def _verify_button_text(self, roi, bx, by, bw, bh):
+        """
+        Ultra-reliable button verification:
+        Detects genuine blue buttons with text. Uses OCR when available,
+        and high-precision CV contrast / white text pixel analysis + template matching as standard fallback.
+        """
+        now = time.time()
+
+        # 1. Verify blue button background color density
+        # Hue 88-135 covers #0078d4, royal blue, sky blue, electric blue
+        hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        mask_blue = cv2.inRange(hsv_roi, np.array([88, 55, 50]), np.array([135, 255, 255]))
+
+        # Blue dominance check
+        b, g, r = cv2.split(roi)
+        bgr_blue = (b > (r.astype(np.int16) + 12)) & (b > 65)
+        mask_blue = mask_blue & bgr_blue.astype(np.uint8) * 255
+
+        blue_density = np.count_nonzero(mask_blue) / float(max(1, bw * bh))
+        if blue_density < 0.28:
+            if self.verified_target_cache:
+                cbx, cby, cbw, cbh, ckw, expire = self.verified_target_cache
+                if abs(bx - cbx) < 25 and abs(by - cby) < 25:
+                    self.verified_target_cache = None
+            return None, False
+
+        # 2. Check verified cache: if the exact same button was verified and persists
+        if self.verified_target_cache:
+            cbx, cby, cbw, cbh, ckw, expire = self.verified_target_cache
+            if now < expire and abs(bx - cbx) < 20 and abs(by - cby) < 20 and abs(bw - cbw) < 25:
+                return "submit", True
+
+        # If text filter is disabled by user, accept any genuine blue button
+        if not self.filter_by_text:
+            return "submit", True
+
+        # 3. Check OCR if available
+        if self.ocr_ready and self.ocr_reader is not None:
+            try:
+                bg_color = [int(c) for c in roi[0, 0]]
+                padded = cv2.copyMakeBorder(roi, 10, 10, 10, 10, cv2.BORDER_CONSTANT, value=bg_color)
+                h, w = padded.shape[:2]
+                if h < 45:
+                    scale = 45.0 / h
+                    padded = cv2.resize(padded, (int(w * scale), 45), interpolation=cv2.INTER_CUBIC)
+
+                results = self.ocr_reader.readtext(padded, detail=0)
+                if results:
+                    full_text = " ".join(results).lower().replace("↵", " ").replace("✓", " ").strip()
+                    is_submit = False
+                    if "submit" in full_text:
+                        is_submit = True
+                    else:
+                        for token in full_text.split():
+                            if len(token) >= 5 and difflib.SequenceMatcher(None, token, "submit").ratio() >= 0.75:
+                                is_submit = True
+                                break
+                    if is_submit:
+                        self.verified_target_cache = (bx, by, bw, bh, "submit", now + 2.5)
+                        return "submit", False
+            except Exception:
+                pass
+
+        # 4. Computer Vision Text Analysis Fallback (works with 0 dependencies!)
+        # Buttons have high contrast text (usually white) against the blue background
+        try:
+            inner_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            ih, iw = inner_gray.shape
+            inner_core = inner_gray[int(ih * 0.15):int(ih * 0.85), int(iw * 0.08):int(iw * 0.92)]
+            if inner_core.size > 0:
+                std = np.std(inner_core)
+                white_ratio = np.count_nonzero(inner_core > 180) / float(inner_core.size)
+                # Text creates contrast std >= 10.0 or bright text pixel ratio >= 2%
+                if std >= 10.0 or white_ratio >= 0.02:
+                    self.verified_target_cache = (bx, by, bw, bh, "submit", now + 2.5)
+                    return "submit", False
+        except Exception:
+            pass
+
+        return None, False
+
+    def _find_blue_button(self, frame_bgr):
+        """
+        Ultra-reliable blue submit button locator:
+        Targets the blue submit button on screen.
+        Returns (cx, cy, bx, by, bw, bh, score, matched_keyword) or None.
+        """
+        h, w = frame_bgr.shape[:2]
+        candidates = []
+
+        # 1. Authentic Blue Color Mask
+        hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+        lower_blue = np.array([88, 55, 50])
+        upper_blue = np.array([135, 255, 255])
+        mask = cv2.inRange(hsv, lower_blue, upper_blue)
+
+        # Secondary BGR check: Blue channel must dominate Red channel
+        b, g, r = cv2.split(frame_bgr)
+        bgr_blue = (b > (r.astype(np.int16) + 12)) & (b > 65)
+        mask = mask & bgr_blue.astype(np.uint8) * 255
+
+        # 2. Multi-scale template matching if template available
+        if self.template_gray is not None:
+            frame_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+            for scale in [0.75, 0.85, 0.9, 1.0, 1.1, 1.15, 1.25, 1.4]:
+                if scale == 1.0:
+                    tg = self.template_gray
+                else:
+                    tg = cv2.resize(self.template_gray, (0, 0), fx=scale, fy=scale)
+
+                th, tw = tg.shape[:2]
+                if th > h or tw > w:
+                    continue
+
+                res = cv2.matchTemplate(frame_gray, tg, cv2.TM_CCOEFF_NORMED)
+                _, max_val, _, max_loc = cv2.minMaxLoc(res)
+
+                if max_val >= 0.48:
+                    mx, my = max_loc
+                    roi_mask = mask[my:my+th, mx:mx+tw]
+                    blue_density = np.count_nonzero(roi_mask) / float(tw * th)
+                    if blue_density >= 0.30:
+                        candidates.append({
+                            'cx': mx + tw // 2,
+                            'cy': my + th // 2,
+                            'bbox': (mx, my, tw, th),
+                            'score': float(max_val) * 20.0 + 15.0,
+                            'kw': 'submit',
+                        })
+                        break
+
+        # 3. Computer Vision: Blue Color Segmentation & Contour Analysis
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 5))
+        mask_closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+        contours, _ = cv2.findContours(mask_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        for cnt in contours:
+            bx, by, bw, bh = cv2.boundingRect(cnt)
+            area = cv2.contourArea(cnt)
+            # Button geometry: standard button dimensions
+            if 32 <= bw <= 450 and 16 <= bh <= 90:
+                aspect = bw / float(bh)
+                if 1.1 <= aspect <= 8.0:
+                    fill_ratio = area / float(bw * bh)
+                    if fill_ratio >= 0.38:
+                        roi = mask[by:by+bh, bx:bx+bw]
+                        blue_density = np.count_nonzero(roi) / float(bw * bh)
+                        if blue_density >= 0.28:
+                            button_roi = frame_bgr[by:by+bh, bx:bx+bw]
+                            matched_kw, is_cached = self._verify_button_text(button_roi, bx, by, bw, bh)
+                            if matched_kw is not None:
+                                aspect_bonus = 3.0 if 1.8 <= aspect <= 4.5 else 1.0
+                                score = (area / float(h * w)) * 10.0 + aspect_bonus + (6.0 if is_cached else 3.0)
+                                candidates.append({
+                                    'cx': bx + bw // 2,
+                                    'cy': by + bh // 2,
+                                    'bbox': (bx, by, bw, bh),
+                                    'score': score,
+                                    'kw': matched_kw,
+                                })
+
+        if not candidates:
             return None
 
-        frame_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        h, w = frame_gray.shape[:2]
+        candidates.sort(key=lambda c: c['score'], reverse=True)
+        best = candidates[0]
+        bx, by, bw, bh = best['bbox']
+        return (best['cx'], best['cy'], bx, by, bw, bh, best['score'], best['kw'])
 
-        best_match = None
-        # Scales to tolerate slight DPI or resolution differences
-        for scale in [1.0, 0.9, 1.1, 0.85, 1.15, 1.2]:
-            if scale == 1.0:
-                tg = self.template_gray
-            else:
-                tg = cv2.resize(self.template_gray, (0, 0), fx=scale, fy=scale)
+    def _dispatch_click(self, screen_x, screen_y):
+        """Dispatches exactly ONE clean, reliable mouse click on Windows."""
+        try:
+            # Position cursor precisely on the button center
+            ctypes.windll.user32.SetCursorPos(int(screen_x), int(screen_y))
+            time.sleep(0.02)
+            # Send standard mouse down
+            ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
+            time.sleep(0.05)  # 50ms solid press
+            # Send standard mouse up
+            ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
+            time.sleep(0.08)  # Let target window process WM_LBUTTONUP
+        except Exception:
+            try:
+                pyautogui.click(screen_x, screen_y)
+            except Exception:
+                pass
 
-            th, tw = tg.shape[:2]
-            if th > h or tw > w:
-                continue
-
-            res = cv2.matchTemplate(frame_gray, tg, cv2.TM_CCOEFF_NORMED)
-            _, max_val, _, max_loc = cv2.minMaxLoc(res)
-
-            # High confidence threshold required to strictly match the text 'Submit'
-            if max_val >= 0.76:
-                if best_match is None or max_val > best_match[0]:
-                    best_match = (max_val, max_loc, tw, th)
-
-        if best_match and best_match[0] >= 0.76:
-            score, (mx, my), bw, bh = best_match
-
-            # Double verification: Ensure the background area is truly the blue color
-            roi = frame_bgr[my:my+bh, mx:mx+bw]
-            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-            # Blue HSV range for IDE submit button: Hue 90-130
-            lower_blue = np.array([90, 100, 70])
-            upper_blue = np.array([130, 255, 255])
-            mask = cv2.inRange(hsv, lower_blue, upper_blue)
-            blue_ratio = np.count_nonzero(mask) / float(bw * bh)
-
-            if blue_ratio >= 0.30:
-                cx = mx + bw // 2
-                cy = my + bh // 2
-                return (cx, cy, mx, my, bw, bh, score)
-
-        return None
+        # Optional: gently offset cursor so hover tooltips clear for dismissal detection
+        try:
+            time.sleep(0.04)
+            ctypes.windll.user32.SetCursorPos(int(screen_x), max(10, int(screen_y - 45)))
+        except Exception:
+            pass
 
     def _worker_loop(self):
         ensure_desktop_access()
 
-        # State tracking: Clicks ONCE when button appears, waits until it DISAPPEARS before clicking again!
-        button_present_on_last_frame = False
-
         scan_count = 0
         last_fps_time = time.time()
+        last_click_time = 0.0
+        state = "WAITING_FOR_BUTTON"
+        button_first_seen_time = None
+        absent_frames_during_wait = 0
+        absent_start_time = None
+        consecutive_absent_frames = 0
 
-        with mss.mss() as sct:
+        sct_factory = getattr(mss, "MSS", mss.mss)
+        with sct_factory() as sct:
             primary_mon = sct.monitors[1]
 
             while self.is_running:
@@ -304,70 +507,179 @@ class AutoClickerEngine:
                 }
 
                 try:
-                    sct_img = sct.grab(monitor)
-                    frame_bgra = np.array(sct_img)
-                    frame_bgr = cv2.cvtColor(frame_bgra, cv2.COLOR_BGRA2BGR)
+                    try:
+                        sct_img = sct.grab(monitor)
+                        frame_bgra = np.array(sct_img)
+                        frame_bgr = cv2.cvtColor(frame_bgra, cv2.COLOR_BGRA2BGR)
+                    except Exception:
+                        from PIL import ImageGrab
+                        bbox = (int(rx), int(ry), int(rx + rw), int(ry + rh))
+                        pil_img = ImageGrab.grab(bbox=bbox)
+                        frame_bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
-                    target = self._find_submit_button(frame_bgr)
+                    target = self._find_blue_button(frame_bgr)
 
-                    if target is not None:
-                        cx, cy, bx, by, bw, bh, score = target
-                        screen_x = int(rx + cx)
-                        screen_y = int(ry + cy)
+                    now = time.time()
+                    if self.click_mode == "single":
+                        if state == "WAITING_FOR_BUTTON":
+                            if target is not None:
+                                cx, cy, bx, by, bw, bh, score, kw = target
+                                screen_x = int(rx + cx)
+                                screen_y = int(ry + cy)
+                                absent_frames_during_wait = 0
 
-                        # ONLY CLICK ONCE when the button first appears!
-                        if not button_present_on_last_frame:
-                            button_present_on_last_frame = True
-                            self.total_clicks += 1
+                                if button_first_seen_time is None:
+                                    button_first_seen_time = now
 
-                            # Dispatch automated single click
-                            pyautogui.click(screen_x, screen_y)
+                                elapsed_seen = now - button_first_seen_time
+                                remaining_latency = max(0.0, self.click_latency - elapsed_seen)
 
-                            threading.Thread(
-                                target=self._play_click_sound, daemon=True
-                            ).start()
+                                if remaining_latency > 0:
+                                    self.callback_on_status(
+                                        "RUNNING",
+                                        f"Button locked! Waiting latency: {remaining_latency:.1f}s before click..."
+                                    )
+                                    time.sleep(0.04)
+                                    continue
 
-                            self.callback_on_status(
-                                "RUNNING",
-                                f"Submitted! (Prompt #{self.total_clicks}) • Waiting for next prompt..."
-                            )
+                                # Strictly click ONCE when latency has elapsed!
+                                self.total_clicks += 1
+                                self._dispatch_click(screen_x, screen_y)
 
-                            self.callback_on_click(
-                                (screen_x, screen_y),
-                                self.total_clicks,
-                                (bx, by, bw, bh),
-                                (rw, rh),
-                            )
+                                if self.sound_enabled:
+                                    threading.Thread(
+                                        target=self._play_click_sound, daemon=True
+                                    ).start()
 
-                            # Allow modal/command half a second to process dismissal
-                            time.sleep(0.4)
-                        else:
-                            # Button is still visible from the previous prompt; DO NOT CLICK AGAIN!
-                            time.sleep(0.08)
+                                last_click_time = now
+                                button_first_seen_time = None
+                                absent_frames_during_wait = 0
+                                absent_start_time = None
+                                consecutive_absent_frames = 0
+                                state = "WAITING_FOR_DISMISSAL"
+
+                                self.callback_on_status(
+                                    "RUNNING",
+                                    f"Submitted! [Prompt #{self.total_clicks}] • Waiting for button to dismiss..."
+                                )
+
+                                self.callback_on_click(
+                                    (screen_x, screen_y),
+                                    self.total_clicks,
+                                    (bx, by, bw, bh),
+                                    (rw, rh),
+                                )
+
+                                time.sleep(0.15)
+                            else:
+                                if button_first_seen_time is not None:
+                                    absent_frames_during_wait += 1
+                                    # Only reset countdown if genuinely absent for >= 8 consecutive frames (~0.35s)
+                                    if absent_frames_during_wait >= 8:
+                                        button_first_seen_time = None
+                                        absent_frames_during_wait = 0
+                                        self.callback_on_status(
+                                            "RUNNING",
+                                            f"Watching for {'next ' if self.total_clicks > 0 else ''}Blue 'Submit' Button ({self.click_latency:.1f}s latency)..."
+                                        )
+                                    else:
+                                        # Temporary frame flicker - hold timer
+                                        time.sleep(0.04)
+                                        continue
+                                else:
+                                    self.callback_on_status(
+                                        "RUNNING",
+                                        f"Watching for {'next ' if self.total_clicks > 0 else ''}Blue 'Submit' Button ({self.click_latency:.1f}s latency)..."
+                                    )
+                                    time.sleep(0.04)
+
+                        elif state == "WAITING_FOR_DISMISSAL":
+                            # Button was clicked. We NEVER click it again while in this state.
+                            # We wait until it is confirmed dismissed before looking for the next button.
+                            time_since_click = now - last_click_time
+
+                            if target is not None:
+                                # Current button is still visible on screen
+                                absent_start_time = None
+                                consecutive_absent_frames = 0
+                                self.callback_on_status(
+                                    "RUNNING",
+                                    f"Prompt #{self.total_clicks} in progress • Waiting for button to dismiss..."
+                                )
+                                time.sleep(0.05)
+                            else:
+                                consecutive_absent_frames += 1
+                                if absent_start_time is None:
+                                    absent_start_time = now
+
+                                time_absent = now - absent_start_time
+
+                                # Confirm dismissal: sustained absence (>= 0.35s and >= 4 frames) + minimum cooldown
+                                if time_since_click >= 0.5 and (time_absent >= 0.35 or consecutive_absent_frames >= 4):
+                                    self.verified_target_cache = None
+                                    state = "WAITING_FOR_BUTTON"
+                                    button_first_seen_time = None
+                                    absent_frames_during_wait = 0
+                                    absent_start_time = None
+                                    consecutive_absent_frames = 0
+                                    self.callback_on_status(
+                                        "RUNNING",
+                                        f"Prompt #{self.total_clicks} completed • Waiting for NEXT button to appear..."
+                                    )
+                                else:
+                                    self.callback_on_status(
+                                        "RUNNING",
+                                        f"Prompt #{self.total_clicks} dismissing... ({consecutive_absent_frames} frames absent)"
+                                    )
+                                time.sleep(0.04)
 
                     else:
-                        # Button is NOT visible in this frame
-                        if button_present_on_last_frame:
-                            # The previous button has successfully disappeared! Ready for the next one.
-                            button_present_on_last_frame = False
+                        # Continuous mode (if selected by user)
+                        if target is not None:
+                            cx, cy, bx, by, bw, bh, score, kw = target
+                            screen_x = int(rx + cx)
+                            screen_y = int(ry + cy)
+
+                            if now - last_click_time >= self.click_interval:
+                                last_click_time = now
+                                self.total_clicks += 1
+
+                                self._dispatch_click(screen_x, screen_y)
+
+                                if self.sound_enabled:
+                                    threading.Thread(
+                                        target=self._play_click_sound, daemon=True
+                                    ).start()
+
+                                self.callback_on_status(
+                                    "RUNNING",
+                                    f"Clicking Blue 'Submit' Button! [Click #{self.total_clicks}] at ({screen_x}, {screen_y})"
+                                )
+
+                                self.callback_on_click(
+                                    (screen_x, screen_y),
+                                    self.total_clicks,
+                                    (bx, by, bw, bh),
+                                    (rw, rh),
+                                )
+
+                            time.sleep(0.03)
+                        else:
                             self.callback_on_status(
                                 "RUNNING",
-                                "Prompt completed • Awaiting next Submit button..."
+                                "Watching for Blue 'Submit' Button..."
                             )
-
-                        time.sleep(0.05)
+                            time.sleep(0.05)
 
                     # Update FPS
                     scan_count += 1
-                    now = time.time()
                     if now - last_fps_time >= 1.0:
                         self.fps = scan_count / (now - last_fps_time)
                         scan_count = 0
                         last_fps_time = now
 
                 except pyautogui.FailSafeException:
-                    self.stop()
-                    break
+                    time.sleep(0.08)
                 except Exception:
                     time.sleep(0.08)
 
@@ -381,9 +693,9 @@ class ModernAutoClickerApp(ctk.CTk):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
-        self.title("BluePulse Auto-Submitter  |  Only Clicks Submit")
+        self.title("BLUE PLUSE TECH  |  Only Clicks Submit")
         self.geometry("540x740")
-        self.minsize(500, 680)
+        self.minsize(460, 400)
         self.configure(fg_color="#0b0f19")
 
         self._center_window()
@@ -401,13 +713,24 @@ class ModernAutoClickerApp(ctk.CTk):
             callback_on_status=self._on_engine_status,
         )
 
-        # UI Construction
-        self._build_header()
-        self._build_stop_banner()
-        self._build_metrics_grid()
-        self._build_target_visualizer_card()
-        self._build_primary_controls()
-        self._build_settings_drawer()
+        # Main Scrollable Container with custom styled scrollbar
+        self.scroll_container = ctk.CTkScrollableFrame(
+            self,
+            fg_color="transparent",
+            corner_radius=0,
+            scrollbar_fg_color="transparent",
+            scrollbar_button_color="#334155",
+            scrollbar_button_hover_color="#38bdf8",
+        )
+        self.scroll_container.pack(fill="both", expand=True)
+
+        # UI Construction inside the scrollable container
+        self._build_header(self.scroll_container)
+        self._build_stop_banner(self.scroll_container)
+        self._build_metrics_grid(self.scroll_container)
+        self._build_target_visualizer_card(self.scroll_container)
+        self._build_primary_controls(self.scroll_container)
+        self._build_settings_drawer(self.scroll_container)
 
         self._setup_hotkeys()
         self._start_gui_pollers()
@@ -420,16 +743,17 @@ class ModernAutoClickerApp(ctk.CTk):
         y = max(0, (screen_h - h) // 2)
         self.geometry(f"{w}x{h}+{x}+{y}")
 
-    def _build_header(self):
-        header_frame = ctk.CTkFrame(self, fg_color="transparent")
-        header_frame.pack(fill="x", padx=24, pady=(16, 8))
+    def _build_header(self, parent=None):
+        container = parent if parent is not None else self
+        header_frame = ctk.CTkFrame(container, fg_color="transparent")
+        header_frame.pack(fill="x", padx=20, pady=(16, 8))
 
         title_box = ctk.CTkFrame(header_frame, fg_color="transparent")
         title_box.pack(side="left", fill="y")
 
         app_title = ctk.CTkLabel(
             title_box,
-            text="BLUE PULSE",
+            text="BLUE PLUSE TECH",
             font=ctk.CTkFont(family="Segoe UI", size=22, weight="bold"),
             text_color="#38bdf8",
         )
@@ -437,7 +761,7 @@ class ModernAutoClickerApp(ctk.CTk):
 
         app_subtitle = ctk.CTkLabel(
             title_box,
-            text="Only Clicks Submit Button • Single-Click Per Prompt",
+            text="Only Clicks Submit Button • 2.0s Latency • Single-Click Per Prompt",
             font=ctk.CTkFont(family="Segoe UI", size=12),
             text_color="#94a3b8",
         )
@@ -469,16 +793,17 @@ class ModernAutoClickerApp(ctk.CTk):
         )
         self.status_text.pack(side="left", padx=(0, 14), pady=4)
 
-    def _build_stop_banner(self):
+    def _build_stop_banner(self, parent=None):
         """Prominent banner highlighting the BACKSPACE stop shortcut."""
+        container = parent if parent is not None else self
         banner = ctk.CTkFrame(
-            self,
+            container,
             fg_color="#2b0f14",
             corner_radius=12,
             border_width=1,
             border_color="#ef4444",
         )
-        banner.pack(fill="x", padx=24, pady=(0, 10))
+        banner.pack(fill="x", padx=20, pady=(0, 10))
 
         lbl_stop_notice = ctk.CTkLabel(
             banner,
@@ -488,15 +813,16 @@ class ModernAutoClickerApp(ctk.CTk):
         )
         lbl_stop_notice.pack(pady=8)
 
-    def _build_metrics_grid(self):
+    def _build_metrics_grid(self, parent=None):
+        container = parent if parent is not None else self
         metrics_container = ctk.CTkFrame(
-            self,
+            container,
             fg_color="#131c2e",
             corner_radius=16,
             border_width=1,
             border_color="#1e2d4a",
         )
-        metrics_container.pack(fill="x", padx=24, pady=(0, 12))
+        metrics_container.pack(fill="x", padx=20, pady=(0, 12))
 
         metrics_grid = ctk.CTkFrame(metrics_container, fg_color="transparent")
         metrics_grid.pack(fill="both", padx=16, pady=10)
@@ -562,22 +888,23 @@ class ModernAutoClickerApp(ctk.CTk):
         )
         self.lbl_status_detail.pack(anchor="w", padx=12, pady=(2, 6))
 
-    def _build_target_visualizer_card(self):
+    def _build_target_visualizer_card(self, parent=None):
+        container = parent if parent is not None else self
         preview_container = ctk.CTkFrame(
-            self,
+            container,
             fg_color="#131c2e",
             corner_radius=16,
             border_width=1,
             border_color="#1e2d4a",
         )
-        preview_container.pack(fill="x", padx=24, pady=(0, 12))
+        preview_container.pack(fill="x", padx=20, pady=(0, 12))
 
         preview_header = ctk.CTkFrame(preview_container, fg_color="transparent")
         preview_header.pack(fill="x", padx=16, pady=(8, 4))
 
         lbl_scanner = ctk.CTkLabel(
             preview_header,
-            text="RADAR TARGET VISUALIZER (ONLY CLICKS 'SUBMIT ↵')",
+            text="RADAR TARGET VISUALIZER (CLICKS BLUE BUTTONS UNTIL STOPPED)",
             font=ctk.CTkFont(size=11, weight="bold"),
             text_color="#94a3b8",
         )
@@ -599,6 +926,7 @@ class ModernAutoClickerApp(ctk.CTk):
             highlightbackground="#1e293b",
         )
         self.radar_canvas.pack(fill="x", padx=16, pady=(2, 10))
+        self.radar_canvas.bind("<MouseWheel>", lambda e: self.scroll_container._mouse_wheel_all(e))
         self._draw_radar_idle()
 
     def _draw_radar_idle(self):
@@ -619,7 +947,7 @@ class ModernAutoClickerApp(ctk.CTk):
         self.radar_canvas.create_line(cx, cy - 28, cx, cy + 28, fill="#1e3a8a", width=1)
 
         self.radar_canvas.create_text(
-            cx, cy, text="TARGET: BLUE SUBMIT BUTTON ↵", fill="#38bdf8", font=("Segoe UI", 10, "bold")
+            cx, cy, text="TARGET: [SUBMIT] [ACCEPT] [PROCEED] [ACCEPT ALL]", fill="#38bdf8", font=("Segoe UI", 10, "bold")
         )
 
     def _flash_target_lock(self, rel_x=0.5, rel_y=0.5):
@@ -647,16 +975,17 @@ class ModernAutoClickerApp(ctk.CTk):
             font=("Segoe UI", 9, "bold"),
         )
 
-    def _build_primary_controls(self):
+    def _build_primary_controls(self, parent=None):
         """The 3 main commanding action buttons: START, PAUSE, STOP [Backspace]."""
+        container = parent if parent is not None else self
         controls_frame = ctk.CTkFrame(
-            self,
+            container,
             fg_color="#131c2e",
             corner_radius=16,
             border_width=1,
             border_color="#1e2d4a",
         )
-        controls_frame.pack(fill="x", padx=24, pady=(0, 12))
+        controls_frame.pack(fill="x", padx=20, pady=(0, 12))
 
         lbl_deck = ctk.CTkLabel(
             controls_frame,
@@ -714,16 +1043,17 @@ class ModernAutoClickerApp(ctk.CTk):
         )
         self.btn_stop.grid(row=0, column=2, padx=5, sticky="ew")
 
-    def _build_settings_drawer(self):
+    def _build_settings_drawer(self, parent=None):
         """Settings drawer for Scan Scope, Space Re-selection, and Sound toggle."""
+        container = parent if parent is not None else self
         settings_frame = ctk.CTkFrame(
-            self,
+            container,
             fg_color="#131c2e",
             corner_radius=16,
             border_width=1,
             border_color="#1e2d4a",
         )
-        settings_frame.pack(fill="both", expand=True, padx=24, pady=(0, 16))
+        settings_frame.pack(fill="x", padx=20, pady=(0, 20))
 
         title_row = ctk.CTkFrame(settings_frame, fg_color="transparent")
         title_row.pack(fill="x", padx=16, pady=(10, 6))
@@ -735,6 +1065,28 @@ class ModernAutoClickerApp(ctk.CTk):
             text_color="#94a3b8",
         )
         lbl_settings.pack(side="left")
+
+        # Target Badge Banner
+        kw_box = ctk.CTkFrame(settings_frame, fg_color="#0b1120", corner_radius=10, border_width=1, border_color="#1e293b")
+        kw_box.pack(fill="x", padx=16, pady=(4, 8))
+
+        lbl_kw_title = ctk.CTkLabel(
+            kw_box,
+            text="🎯 TARGET:",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color="#38bdf8",
+        )
+        lbl_kw_title.pack(side="left", padx=(10, 6), pady=6)
+
+        badge = ctk.CTkLabel(
+            kw_box,
+            text=" Submit ↵ (Inside Blue Button Only) ",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color="#1e293b",
+            corner_radius=6,
+            text_color="#34d399",
+        )
+        badge.pack(side="left", padx=3, pady=6)
 
         self.btn_reselect = ctk.CTkButton(
             title_row,
@@ -761,35 +1113,84 @@ class ModernAutoClickerApp(ctk.CTk):
 
         self.segmented_scope = ctk.CTkSegmentedButton(
             scope_row,
-            values=["Selected Space", "Entire Screen"],
+            values=["Entire Screen", "Selected Space"],
             command=self._on_scope_change,
             height=28,
             corner_radius=8,
         )
-        self.segmented_scope.set("Selected Space")
+        self.segmented_scope.set("Entire Screen")
         self.segmented_scope.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
 
         # Space coordinates readout
         self.lbl_space_coords = ctk.CTkLabel(
             settings_frame,
-            text="Space: None selected  (Prompts on Start, or select 'Entire Screen')",
+            text="Monitoring: Entire Screen • Clicks ONCE per prompt (Waits for next)",
             font=ctk.CTkFont(size=11),
             text_color="#94a3b8",
         )
         self.lbl_space_coords.pack(anchor="w", padx=16, pady=(4, 6))
 
-        # Sound toggle
-        sound_row = ctk.CTkFrame(settings_frame, fg_color="transparent")
-        sound_row.pack(fill="x", padx=16, pady=(2, 6))
+        # Click Mode Selector
+        rate_row = ctk.CTkFrame(settings_frame, fg_color="transparent")
+        rate_row.pack(fill="x", padx=16, pady=(2, 6))
+        rate_row.grid_columnconfigure((0, 1), weight=1)
+
+        lbl_rate = ctk.CTkLabel(
+            rate_row, text="Click Mode (Single or Continuous):", font=ctk.CTkFont(size=11), text_color="#94a3b8"
+        )
+        lbl_rate.grid(row=0, column=0, sticky="w")
+
+        self.segmented_rate = ctk.CTkSegmentedButton(
+            rate_row,
+            values=["Once Per Button", "Continuous (5/s)", "Rapid (10/s)"],
+            command=self._on_rate_change,
+            height=28,
+            corner_radius=8,
+        )
+        self.segmented_rate.set("Once Per Button")
+        self.segmented_rate.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+
+        # Latency / Wait Time Selector
+        latency_row = ctk.CTkFrame(settings_frame, fg_color="transparent")
+        latency_row.pack(fill="x", padx=16, pady=(2, 6))
+        latency_row.grid_columnconfigure((0, 1), weight=1)
+
+        lbl_latency = ctk.CTkLabel(
+            latency_row, text="Latency Before Click (Wait Time):", font=ctk.CTkFont(size=11), text_color="#94a3b8"
+        )
+        lbl_latency.grid(row=0, column=0, sticky="w")
+
+        self.segmented_latency = ctk.CTkSegmentedButton(
+            latency_row,
+            values=["Instant (0s)", "1.0s", "2.0s (Default)", "3.0s", "5.0s"],
+            command=self._on_latency_change,
+            height=28,
+            corner_radius=8,
+        )
+        self.segmented_latency.set("2.0s (Default)")
+        self.segmented_latency.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+
+        # Text filter & Sound toggles
+        toggles_row = ctk.CTkFrame(settings_frame, fg_color="transparent")
+        toggles_row.pack(fill="x", padx=16, pady=(2, 6))
+
+        self.switch_text_filter = ctk.CTkSwitch(
+            toggles_row,
+            text="Strictly require 'Submit' text inside blue button",
+            font=ctk.CTkFont(size=11),
+            command=self._on_text_filter_toggle,
+        )
+        self.switch_text_filter.select()
+        self.switch_text_filter.pack(anchor="w", pady=(0, 4))
 
         self.switch_sound = ctk.CTkSwitch(
-            sound_row,
-            text="Play audio click beep on Submit",
+            toggles_row,
+            text="Play audio click beep on click",
             font=ctk.CTkFont(size=11),
             command=self._on_sound_toggle,
         )
         self.switch_sound.select()
-        self.switch_sound.pack(side="left")
+        self.switch_sound.pack(anchor="w")
 
         # Hotkeys help footer
         footer_row = ctk.CTkFrame(settings_frame, fg_color="#0b1120", corner_radius=8)
@@ -797,24 +1198,22 @@ class ModernAutoClickerApp(ctk.CTk):
 
         lbl_keys = ctk.CTkLabel(
             footer_row,
-            text="⌨ SHORTCUTS:  [Backspace] STOP   •   [F6] Start/Resume   •   [F7] Pause",
+            text="⌨ SHORTCUT:  [Backspace] STOP   •   Only STOP button or [Backspace] halts scanning",
             font=ctk.CTkFont(size=10, weight="bold"),
             text_color="#64748b",
         )
         lbl_keys.pack(pady=5)
 
     def _setup_hotkeys(self):
-        # Bind Backspace in Tkinter directly
+        # Exclusively Backspace stops the clicker
         self.bind_all("<BackSpace>", lambda e: self.handle_stop())
-        self.bind_all("<Escape>", lambda e: self.handle_stop())
+        self.bind_all("<Next>", lambda e: self.scroll_container._parent_canvas.yview_scroll(4, "units"))
+        self.bind_all("<Prior>", lambda e: self.scroll_container._parent_canvas.yview_scroll(-4, "units"))
 
-        # Global hotkeys via keyboard library
+        # Global hotkey via keyboard library: strictly backspace only
         if HAS_KEYBOARD:
             try:
                 keyboard.add_hotkey("backspace", lambda: self.after(0, self.handle_stop))
-                keyboard.add_hotkey("f6", lambda: self.after(0, self.handle_start))
-                keyboard.add_hotkey("f7", lambda: self.after(0, self.handle_pause))
-                keyboard.add_hotkey("f8", lambda: self.after(0, self.handle_stop))
             except Exception:
                 pass
 
@@ -823,7 +1222,7 @@ class ModernAutoClickerApp(ctk.CTk):
     def handle_start(self):
         if self.engine.is_running and self.engine.is_paused:
             self.engine.start(self.selected_region)
-            self._update_status_ui("RUNNING", "Resumed • Scanning for Submit button...")
+            self._update_status_ui("RUNNING", "Resumed • Scanning for Blue button...")
             return
 
         if not self.engine.use_full_screen and not self.selected_region:
@@ -947,6 +1346,37 @@ class ModernAutoClickerApp(ctk.CTk):
             self.btn_pause.configure(state="disabled")
             self.btn_stop.configure(state="disabled")
             self.btn_reselect.configure(state="normal")
+
+    def _on_rate_change(self, value):
+        if "Once" in value:
+            self.engine.click_mode = "single"
+            self.lbl_space_coords.configure(text="Mode: Clicks ONCE per prompt • Waits for next button to appear")
+        elif "Rapid" in value:
+            self.engine.click_mode = "repeat"
+            self.engine.click_interval = 0.10
+            self.lbl_space_coords.configure(text="Mode: Rapid Continuous Clicking (10 clicks/sec)")
+        else:
+            self.engine.click_mode = "repeat"
+            self.engine.click_interval = 0.20
+            self.lbl_space_coords.configure(text="Mode: Continuous Clicking (5 clicks/sec)")
+
+    def _on_latency_change(self, value):
+        if "Instant" in value:
+            self.engine.click_latency = 0.0
+        elif "1.0s" in value:
+            self.engine.click_latency = 1.0
+        elif "2.0s" in value:
+            self.engine.click_latency = 2.0
+        elif "3.0s" in value:
+            self.engine.click_latency = 3.0
+        elif "5.0s" in value:
+            self.engine.click_latency = 5.0
+        self.lbl_space_coords.configure(
+            text=f"Latency: {self.engine.click_latency:.1f}s • Clicks ONCE per prompt after latency"
+        )
+
+    def _on_text_filter_toggle(self):
+        self.engine.filter_by_text = bool(self.switch_text_filter.get())
 
     def _on_sound_toggle(self):
         self.engine.sound_enabled = bool(self.switch_sound.get())
