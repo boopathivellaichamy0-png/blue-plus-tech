@@ -21,6 +21,60 @@ import mss
 import difflib
 import re
 
+# Native Windows OCR (winocr) - super-fast 10ms local OCR without heavy dependencies
+try:
+    import winocr
+    HAS_WINOCR = True
+except Exception:
+    HAS_WINOCR = False
+
+# Strictly accepted button target keywords (case-insensitive)
+TARGET_KEYWORDS = ["submit", "accept all", "accept", "proceed"]
+
+def normalize_button_text(text):
+    if not text:
+        return ""
+    cleaned = re.sub(r'[^a-zA-Z0-9\s]', ' ', text.lower())
+    return ' '.join(cleaned.split())
+
+def match_target_button_keyword(text):
+    """
+    Strictly verifies whether text matches one of the target button keywords:
+    - 'submit'
+    - 'accept'
+    - 'accept all'
+    - 'proceed'
+    
+    Returns matched keyword string or None.
+    Rejects any negative phrasing ('do not accept', 'cannot submit', 'cancel', etc.).
+    """
+    clean = normalize_button_text(text)
+    if not clean:
+        return None
+
+    # Negative words guard: reject rejection buttons or negative phrases
+    if any(neg in clean for neg in ["not", "dont", "don't", "cancel", "decline", "reject", "close", "skip", "ignore"]):
+        return None
+
+    tokens = clean.split()
+
+    if "accept all" in clean:
+        return "accept all"
+    if "submit" in tokens or clean == "submit":
+        return "submit"
+    if "proceed" in tokens or clean == "proceed":
+        return "proceed"
+    if "accept" in tokens or clean == "accept":
+        return "accept"
+
+    # Fuzzy match on tokens for minor OCR inaccuracies (e.g. 'submlt' -> 'submit', 'procced' -> 'proceed')
+    for tok in tokens:
+        for kw in ["submit", "accept", "proceed"]:
+            if len(tok) >= 4 and difflib.SequenceMatcher(None, tok, kw).ratio() >= 0.80:
+                return kw
+
+    return None
+
 # Enable DPI Awareness for pixel-perfect coordinates on Windows
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -277,22 +331,40 @@ class AutoClickerEngine:
     def _verify_button_text(self, roi, bx, by, bw, bh):
         """
         Ultra-reliable button verification:
-        Detects genuine blue buttons with text. Uses OCR when available,
-        and high-precision CV contrast / white text pixel analysis + template matching as standard fallback.
+        Ensures the candidate is an ACTUAL BUTTON (not normal text) and strictly contains
+        one of the target words: 'submit', 'accept', 'accept all', 'proceed'.
+        Rejects all non-target words and plain page text.
         """
         now = time.time()
 
-        # 1. Verify blue button background color density
-        # Hue 88-135 covers #0078d4, royal blue, sky blue, electric blue
-        hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        mask_blue = cv2.inRange(hsv_roi, np.array([88, 55, 50]), np.array([135, 255, 255]))
+        # 1. Physical Button Container Checks (Reject Normal Text sentences, letters, abnormal boxes)
+        if bw < 35 or bw > 480 or bh < 18 or bh > 95:
+            return None, False
 
-        # Blue dominance check
+        aspect = bw / float(bh)
+        if aspect < 1.05 or aspect > 8.5:
+            return None, False
+
+        # 2. Check Blue Button Color Fill (Density)
+        # In a real blue button, the box is filled with blue (blue_density >= 0.28).
+        # In normal blue text, only thin font strokes are blue (blue_density < 0.18).
+        hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        lower_blue = np.array([85, 45, 45])
+        upper_blue = np.array([135, 255, 255])
+        mask_blue = cv2.inRange(hsv_roi, lower_blue, upper_blue)
+
         b, g, r = cv2.split(roi)
-        bgr_blue = (b > (r.astype(np.int16) + 12)) & (b > 65)
+        bgr_blue = (b > (r.astype(np.int16) + 10)) & (b > 60)
         mask_blue = mask_blue & bgr_blue.astype(np.uint8) * 255
 
         blue_density = np.count_nonzero(mask_blue) / float(max(1, bw * bh))
+
+        # Check for normal text on white page (reject!)
+        gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        white_px_ratio = np.count_nonzero(gray_roi > 240) / float(gray_roi.size)
+        if white_px_ratio > 0.85 and blue_density < 0.25:
+            return None, False
+
         if blue_density < 0.28:
             if self.verified_target_cache:
                 cbx, cby, cbw, cbh, ckw, expire = self.verified_target_cache
@@ -300,65 +372,66 @@ class AutoClickerEngine:
                     self.verified_target_cache = None
             return None, False
 
-        # 2. Check verified cache: if the exact same button was verified and persists
+        # 3. Check verified cache: if the exact same button was verified and persists
         if self.verified_target_cache:
             cbx, cby, cbw, cbh, ckw, expire = self.verified_target_cache
             if now < expire and abs(bx - cbx) < 20 and abs(by - cby) < 20 and abs(bw - cbw) < 25:
-                return "submit", True
+                return ckw, True
 
         # If text filter is disabled by user, accept any genuine blue button
         if not self.filter_by_text:
             return "submit", True
 
-        # 3. Check OCR if available
-        if self.ocr_ready and self.ocr_reader is not None:
-            try:
-                bg_color = [int(c) for c in roi[0, 0]]
-                padded = cv2.copyMakeBorder(roi, 10, 10, 10, 10, cv2.BORDER_CONSTANT, value=bg_color)
-                h, w = padded.shape[:2]
-                if h < 45:
-                    scale = 45.0 / h
-                    padded = cv2.resize(padded, (int(w * scale), 45), interpolation=cv2.INTER_CUBIC)
+        # 4. OCR Text Recognition: WinOCR (ultra-fast Windows native) -> EasyOCR
+        detected_text = ""
+        bg_color = [int(c) for c in roi[0, 0]]
+        padded = cv2.copyMakeBorder(roi, 10, 10, 10, 10, cv2.BORDER_CONSTANT, value=bg_color)
+        ph, pw = padded.shape[:2]
+        if ph < 50:
+            scale = 50.0 / ph
+            padded = cv2.resize(padded, (int(pw * scale), 50), interpolation=cv2.INTER_CUBIC)
 
+        if HAS_WINOCR:
+            try:
+                res = winocr.recognize_cv2_sync(padded, 'en')
+                detected_text = res.get('text', '').strip()
+            except Exception:
+                detected_text = ""
+
+        if not detected_text and self.ocr_ready and self.ocr_reader is not None:
+            try:
                 results = self.ocr_reader.readtext(padded, detail=0)
                 if results:
-                    full_text = " ".join(results).lower().replace("↵", " ").replace("✓", " ").strip()
-                    is_submit = False
-                    if "submit" in full_text:
-                        is_submit = True
-                    else:
-                        for token in full_text.split():
-                            if len(token) >= 5 and difflib.SequenceMatcher(None, token, "submit").ratio() >= 0.75:
-                                is_submit = True
-                                break
-                    if is_submit:
-                        self.verified_target_cache = (bx, by, bw, bh, "submit", now + 2.5)
-                        return "submit", False
+                    detected_text = " ".join(results).strip()
             except Exception:
-                pass
+                detected_text = ""
 
-        # 4. Computer Vision Text Analysis Fallback (works with 0 dependencies!)
-        # Buttons have high contrast text (usually white) against the blue background
-        try:
-            inner_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-            ih, iw = inner_gray.shape
-            inner_core = inner_gray[int(ih * 0.15):int(ih * 0.85), int(iw * 0.08):int(iw * 0.92)]
-            if inner_core.size > 0:
-                std = np.std(inner_core)
-                white_ratio = np.count_nonzero(inner_core > 180) / float(inner_core.size)
-                # Text creates contrast std >= 10.0 or bright text pixel ratio >= 2%
-                if std >= 10.0 or white_ratio >= 0.02:
+        if detected_text:
+            matched_kw = match_target_button_keyword(detected_text)
+            if matched_kw:
+                self.verified_target_cache = (bx, by, bw, bh, matched_kw, now + 3.0)
+                return matched_kw, False
+            else:
+                # Text was recognized, but it was NOT one of our target words (e.g. 'Cancel', 'Help', etc.) -> REJECT!
+                return None, False
+
+        # If OCR did not detect text or failed to run, fall back to template matching verification
+        if self.template_gray is not None:
+            roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            th, tw = self.template_gray.shape[:2]
+            if roi_gray.shape[0] >= th and roi_gray.shape[1] >= tw:
+                res = cv2.matchTemplate(roi_gray, self.template_gray, cv2.TM_CCOEFF_NORMED)
+                _, max_val, _, _ = cv2.minMaxLoc(res)
+                if max_val >= 0.55:
                     self.verified_target_cache = (bx, by, bw, bh, "submit", now + 2.5)
                     return "submit", False
-        except Exception:
-            pass
 
         return None, False
 
     def _find_blue_button(self, frame_bgr):
         """
-        Ultra-reliable blue submit button locator:
-        Targets the blue submit button on screen.
+        Ultra-reliable blue button locator:
+        Targets blue buttons with text 'Submit', 'Accept', 'Accept All', or 'Proceed'.
         Returns (cx, cy, bx, by, bw, bh, score, matched_keyword) or None.
         """
         h, w = frame_bgr.shape[:2]
@@ -366,13 +439,13 @@ class AutoClickerEngine:
 
         # 1. Authentic Blue Color Mask
         hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-        lower_blue = np.array([88, 55, 50])
+        lower_blue = np.array([85, 45, 45])
         upper_blue = np.array([135, 255, 255])
         mask = cv2.inRange(hsv, lower_blue, upper_blue)
 
         # Secondary BGR check: Blue channel must dominate Red channel
         b, g, r = cv2.split(frame_bgr)
-        bgr_blue = (b > (r.astype(np.int16) + 12)) & (b > 65)
+        bgr_blue = (b > (r.astype(np.int16) + 10)) & (b > 60)
         mask = mask & bgr_blue.astype(np.uint8) * 255
 
         # 2. Multi-scale template matching if template available
@@ -391,19 +464,22 @@ class AutoClickerEngine:
                 res = cv2.matchTemplate(frame_gray, tg, cv2.TM_CCOEFF_NORMED)
                 _, max_val, _, max_loc = cv2.minMaxLoc(res)
 
-                if max_val >= 0.48:
+                if max_val >= 0.52:
                     mx, my = max_loc
                     roi_mask = mask[my:my+th, mx:mx+tw]
                     blue_density = np.count_nonzero(roi_mask) / float(tw * th)
                     if blue_density >= 0.30:
-                        candidates.append({
-                            'cx': mx + tw // 2,
-                            'cy': my + th // 2,
-                            'bbox': (mx, my, tw, th),
-                            'score': float(max_val) * 20.0 + 15.0,
-                            'kw': 'submit',
-                        })
-                        break
+                        tpl_roi = frame_bgr[my:my+th, mx:mx+tw]
+                        kw, is_cached = self._verify_button_text(tpl_roi, mx, my, tw, th)
+                        if kw is not None:
+                            candidates.append({
+                                'cx': mx + tw // 2,
+                                'cy': my + th // 2,
+                                'bbox': (mx, my, tw, th),
+                                'score': float(max_val) * 20.0 + 15.0,
+                                'kw': kw,
+                            })
+                            break
 
         # 3. Computer Vision: Blue Color Segmentation & Contour Analysis
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 5))
@@ -415,9 +491,9 @@ class AutoClickerEngine:
             bx, by, bw, bh = cv2.boundingRect(cnt)
             area = cv2.contourArea(cnt)
             # Button geometry: standard button dimensions
-            if 32 <= bw <= 450 and 16 <= bh <= 90:
+            if 35 <= bw <= 480 and 18 <= bh <= 95:
                 aspect = bw / float(bh)
-                if 1.1 <= aspect <= 8.0:
+                if 1.05 <= aspect <= 8.5:
                     fill_ratio = area / float(bw * bh)
                     if fill_ratio >= 0.38:
                         roi = mask[by:by+bh, bx:bx+bw]
@@ -537,7 +613,7 @@ class AutoClickerEngine:
                                 if remaining_latency > 0:
                                     self.callback_on_status(
                                         "RUNNING",
-                                        f"Button locked! Waiting latency: {remaining_latency:.1f}s before click..."
+                                        f"Button '{kw.upper()}' locked! Waiting latency: {remaining_latency:.1f}s before click..."
                                     )
                                     time.sleep(0.04)
                                     continue
@@ -560,7 +636,7 @@ class AutoClickerEngine:
 
                                 self.callback_on_status(
                                     "RUNNING",
-                                    f"Submitted! [Prompt #{self.total_clicks}] • Waiting for button to dismiss..."
+                                    f"Clicked '{kw.upper()}'! [Prompt #{self.total_clicks}] • Waiting for button to dismiss..."
                                 )
 
                                 self.callback_on_click(
@@ -580,7 +656,7 @@ class AutoClickerEngine:
                                         absent_frames_during_wait = 0
                                         self.callback_on_status(
                                             "RUNNING",
-                                            f"Watching for {'next ' if self.total_clicks > 0 else ''}Blue 'Submit' Button ({self.click_latency:.1f}s latency)..."
+                                            f"Watching for {'next ' if self.total_clicks > 0 else ''}Button (Submit/Accept/Proceed)..."
                                         )
                                     else:
                                         # Temporary frame flicker - hold timer
@@ -589,7 +665,7 @@ class AutoClickerEngine:
                                 else:
                                     self.callback_on_status(
                                         "RUNNING",
-                                        f"Watching for {'next ' if self.total_clicks > 0 else ''}Blue 'Submit' Button ({self.click_latency:.1f}s latency)..."
+                                        f"Watching for {'next ' if self.total_clicks > 0 else ''}Button (Submit/Accept/Proceed)..."
                                     )
                                     time.sleep(0.04)
 
@@ -761,7 +837,7 @@ class ModernAutoClickerApp(ctk.CTk):
 
         app_subtitle = ctk.CTkLabel(
             title_box,
-            text="Only Clicks Submit Button • 2.0s Latency • Single-Click Per Prompt",
+            text="Clicks 'Submit', 'Accept', 'Proceed' • 2.0s Latency • Single-Click",
             font=ctk.CTkFont(family="Segoe UI", size=12),
             text_color="#94a3b8",
         )
@@ -1176,7 +1252,7 @@ class ModernAutoClickerApp(ctk.CTk):
 
         self.switch_text_filter = ctk.CTkSwitch(
             toggles_row,
-            text="Strictly require 'Submit' text inside blue button",
+            text="Strictly click buttons: 'Submit' | 'Accept' | 'Accept All' | 'Proceed'",
             font=ctk.CTkFont(size=11),
             command=self._on_text_filter_toggle,
         )
