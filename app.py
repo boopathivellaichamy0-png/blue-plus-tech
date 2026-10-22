@@ -2,7 +2,7 @@
 BLUE PLUSE TECH Vision Auto-Clicker
 Specialized for Blue Submit Buttons in AI / IDE Prompts.
 Clicks ONCE per prompt, waits for the modal to dismiss/next to arrive.
-Stop shortcut: BACKSPACE
+Stop shortcut: ANY KEY on keyboard (or STOP button)
 Controls: START, PAUSE, STOP
 """
 
@@ -870,7 +870,7 @@ class ModernAutoClickerApp(ctk.CTk):
         self.status_text.pack(side="left", padx=(0, 14), pady=4)
 
     def _build_stop_banner(self, parent=None):
-        """Prominent banner highlighting the BACKSPACE stop shortcut."""
+        """Prominent banner highlighting the ANY KEY stop shortcut."""
         container = parent if parent is not None else self
         banner = ctk.CTkFrame(
             container,
@@ -883,7 +883,7 @@ class ModernAutoClickerApp(ctk.CTk):
 
         lbl_stop_notice = ctk.CTkLabel(
             banner,
-            text="🛑 EMERGENCY STOP SHORTCUT:  PRESS [ BACKSPACE ] ANYTIME TO STOP",
+            text="🛑 EMERGENCY STOP SHORTCUT:  PRESS [ ANY KEY ] TO STOP",
             font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
             text_color="#fca5a5",
         )
@@ -1274,24 +1274,32 @@ class ModernAutoClickerApp(ctk.CTk):
 
         lbl_keys = ctk.CTkLabel(
             footer_row,
-            text="⌨ SHORTCUT:  [Backspace] STOP   •   Only STOP button or [Backspace] halts scanning",
+            text="⌨ SHORTCUT:  Press ANY KEY to STOP   •   Stops scanning and clicking immediately",
             font=ctk.CTkFont(size=10, weight="bold"),
             text_color="#64748b",
         )
         lbl_keys.pack(pady=5)
 
     def _setup_hotkeys(self):
-        # Exclusively Backspace stops the clicker
-        self.bind_all("<BackSpace>", lambda e: self.handle_stop())
+        # Local Tkinter window: any key press while running stops the clicker
+        self.bind_all("<Key>", lambda e: self._on_any_key_pressed(e))
         self.bind_all("<Next>", lambda e: self.scroll_container._parent_canvas.yview_scroll(4, "units"))
         self.bind_all("<Prior>", lambda e: self.scroll_container._parent_canvas.yview_scroll(-4, "units"))
 
-        # Global hotkey via keyboard library: strictly backspace only
+        # Global system-wide hook: ANY key press stops the clicker when running
         if HAS_KEYBOARD:
             try:
-                keyboard.add_hotkey("backspace", lambda: self.after(0, self.handle_stop))
+                keyboard.on_press(lambda e: self._on_global_key_pressed(e))
             except Exception:
                 pass
+
+    def _on_any_key_pressed(self, event=None):
+        if self.engine.is_running:
+            self.handle_stop()
+
+    def _on_global_key_pressed(self, event=None):
+        if self.engine.is_running:
+            self.after(0, self.handle_stop)
 
     # ==================== CONTROLS ====================
 
@@ -1313,10 +1321,12 @@ class ModernAutoClickerApp(ctk.CTk):
             self._update_status_ui("PAUSED", "Paused by user")
 
     def handle_stop(self):
-        """Emergency Stop triggered via Backspace or Stop button."""
+        """Emergency Stop triggered via ANY Key or Stop button."""
+        if not self.engine.is_running and not self.timer_active:
+            return
         self.engine.stop()
         self.timer_active = False
-        self._update_status_ui("STOPPED", "Application Stopped [Backspace]")
+        self._update_status_ui("STOPPED", "Application Stopped [Key Pressed]")
 
     def _start_engine_session(self):
         self.timer_active = True

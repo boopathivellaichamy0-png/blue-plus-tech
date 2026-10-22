@@ -296,7 +296,7 @@ def main():
     print(" ⚡ BLUE PLUSE TECH AUTONOMOUS BUTTON CLICKER")
     print(" [✓] Target: Buttons: 'Submit' | 'Accept' | 'Accept All' | 'Proceed'")
     print(" [✓] Latency: 2.0s • Clicks ONCE per button • Waits for next")
-    print(" [🛑] STOP SHORTCUT: Press [ BACKSPACE ] or Ctrl+C")
+    print(" [🛑] STOP SHORTCUT: Press ANY KEY or Ctrl+C to Stop")
     print("=" * 65)
 
     ensure_desktop()
@@ -319,13 +319,14 @@ def main():
 
     should_stop = False
 
-    def on_stop():
+    def on_stop(e=None):
         nonlocal should_stop
         should_stop = True
-        print("\n [🛑] BACKSPACE pressed! Stopping...")
+        key_name = getattr(e, 'name', 'Key') if e else 'Key'
+        print(f"\n [🛑] Key '{key_name}' pressed! Emergency stop triggered...")
 
     if HAS_KEYBOARD:
-        keyboard.add_hotkey("backspace", on_stop)
+        keyboard.on_press(on_stop)
 
     STATE_WAITING_FOR_BUTTON = "WAITING_FOR_BUTTON"
     STATE_WAITING_FOR_DISMISSAL = "WAITING_FOR_DISMISSAL"
