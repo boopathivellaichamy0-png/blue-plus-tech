@@ -34,7 +34,8 @@ TARGET_KEYWORDS = ["submit", "accept all", "accept", "proceed"]
 def normalize_button_text(text):
     if not text:
         return ""
-    cleaned = re.sub(r'[^a-zA-Z0-9\s]', ' ', text.lower())
+    s = text.lower().replace("'", "").replace("’", "")
+    cleaned = re.sub(r'[^a-zA-Z0-9\s]', ' ', s)
     return ' '.join(cleaned.split())
 
 def match_target_button_keyword(text):
@@ -52,22 +53,24 @@ def match_target_button_keyword(text):
     if not clean:
         return None
 
-    # Negative words guard: reject rejection buttons or negative phrases
-    if any(neg in clean for neg in ["not", "dont", "don't", "cancel", "decline", "reject", "close", "skip", "ignore"]):
-        return None
-
+    negatives = {"not", "dont", "no", "cancel", "decline", "reject", "close", "skip", "ignore", "never"}
     tokens = clean.split()
+    tokens_set = set(tokens)
+
+    if tokens_set.intersection(negatives):
+        return None
+    if any(neg in clean for neg in ["dont", "do not", "cannot", "cant"]):
+        return None
 
     if "accept all" in clean:
         return "accept all"
-    if "submit" in tokens or clean == "submit":
+    if "submit" in tokens_set or clean == "submit":
         return "submit"
-    if "proceed" in tokens or clean == "proceed":
+    if "proceed" in tokens_set or clean == "proceed":
         return "proceed"
-    if "accept" in tokens or clean == "accept":
+    if "accept" in tokens_set or clean == "accept":
         return "accept"
 
-    # Fuzzy match on tokens for minor OCR inaccuracies (e.g. 'submlt' -> 'submit', 'procced' -> 'proceed')
     for tok in tokens:
         for kw in ["submit", "accept", "proceed"]:
             if len(tok) >= 4 and difflib.SequenceMatcher(None, tok, kw).ratio() >= 0.80:
@@ -245,7 +248,7 @@ class RegionSelector(tk.Toplevel):
 class AutoClickerEngine:
     """Robust vision engine: strictly detects the 'Submit' text inside the blue button and clicks until stopped."""
 
-    TARGET_KEYWORDS = ["submit"]
+    TARGET_KEYWORDS = ["submit", "accept all", "accept", "proceed"]
 
     def __init__(self, callback_on_click, callback_on_status):
         self.callback_on_click = callback_on_click
@@ -538,24 +541,15 @@ class AutoClickerEngine:
             except Exception:
                 pass
 
-        # Optional: gently offset cursor so hover tooltips clear for dismissal detection
-        try:
-            time.sleep(0.04)
-            ctypes.windll.user32.SetCursorPos(int(screen_x), max(10, int(screen_y - 45)))
-        except Exception:
-            pass
-
     def _worker_loop(self):
         ensure_desktop_access()
 
         scan_count = 0
         last_fps_time = time.time()
         last_click_time = 0.0
-        state = "WAITING_FOR_BUTTON"
+        last_click_pos = None
         button_first_seen_time = None
-        absent_frames_during_wait = 0
-        absent_start_time = None
-        consecutive_absent_frames = 0
+        was_absent = True
 
         sct_factory = getattr(mss, "MSS", mss.mss)
         with sct_factory() as sct:
@@ -597,117 +591,95 @@ class AutoClickerEngine:
 
                     now = time.time()
                     if self.click_mode == "single":
-                        if state == "WAITING_FOR_BUTTON":
-                            if target is not None:
-                                cx, cy, bx, by, bw, bh, score, kw = target
-                                screen_x = int(rx + cx)
-                                screen_y = int(ry + cy)
-                                absent_frames_during_wait = 0
+                        reclick_cooldown = max(1.5, self.click_latency)
+                        time_since_click = now - last_click_time
 
-                                if button_first_seen_time is None:
-                                    button_first_seen_time = now
+                        if target is not None:
+                            cx, cy, bx, by, bw, bh, score, kw = target
+                            screen_x = int(rx + cx)
+                            screen_y = int(ry + cy)
 
-                                elapsed_seen = now - button_first_seen_time
-                                remaining_latency = max(0.0, self.click_latency - elapsed_seen)
+                            # Determine if button is in a different location (>35px away)
+                            is_different_pos = False
+                            if last_click_pos is not None:
+                                dist = ((screen_x - last_click_pos[0]) ** 2 + (screen_y - last_click_pos[1]) ** 2) ** 0.5
+                                if dist > 35:
+                                    is_different_pos = True
 
-                                if remaining_latency > 0:
-                                    self.callback_on_status(
-                                        "RUNNING",
-                                        f"Button '{kw.upper()}' locked! Waiting latency: {remaining_latency:.1f}s before click..."
-                                    )
-                                    time.sleep(0.04)
-                                    continue
+                            # Button is eligible to be clicked if:
+                            # 1. It was absent (new button appeared or page transitioned)
+                            # 2. It is at a distinctly different position (different button on screen)
+                            # 3. Or reclick cooldown has elapsed (allowing repeat submissions/next prompts without getting stuck!)
+                            is_eligible = was_absent or is_different_pos or (time_since_click >= reclick_cooldown)
 
-                                # Strictly click ONCE when latency has elapsed!
-                                self.total_clicks += 1
-                                self._dispatch_click(screen_x, screen_y)
-
-                                if self.sound_enabled:
-                                    threading.Thread(
-                                        target=self._play_click_sound, daemon=True
-                                    ).start()
-
-                                last_click_time = now
-                                button_first_seen_time = None
-                                absent_frames_during_wait = 0
-                                absent_start_time = None
-                                consecutive_absent_frames = 0
-                                state = "WAITING_FOR_DISMISSAL"
-
+                            if not is_eligible:
+                                # Still cooling down from previous click on the same button
+                                rem_cooldown = max(0.0, reclick_cooldown - time_since_click)
                                 self.callback_on_status(
                                     "RUNNING",
-                                    f"Clicked '{kw.upper()}'! [Prompt #{self.total_clicks}] • Waiting for button to dismiss..."
+                                    f"Prompt #{self.total_clicks} clicked • Cooldown {rem_cooldown:.1f}s / waiting for next..."
                                 )
-
-                                self.callback_on_click(
-                                    (screen_x, screen_y),
-                                    self.total_clicks,
-                                    (bx, by, bw, bh),
-                                    (rw, rh),
-                                )
-
-                                time.sleep(0.15)
-                            else:
-                                if button_first_seen_time is not None:
-                                    absent_frames_during_wait += 1
-                                    # Only reset countdown if genuinely absent for >= 8 consecutive frames (~0.35s)
-                                    if absent_frames_during_wait >= 8:
-                                        button_first_seen_time = None
-                                        absent_frames_during_wait = 0
-                                        self.callback_on_status(
-                                            "RUNNING",
-                                            f"Watching for {'next ' if self.total_clicks > 0 else ''}Button (Submit/Accept/Proceed)..."
-                                        )
-                                    else:
-                                        # Temporary frame flicker - hold timer
-                                        time.sleep(0.04)
-                                        continue
-                                else:
-                                    self.callback_on_status(
-                                        "RUNNING",
-                                        f"Watching for {'next ' if self.total_clicks > 0 else ''}Button (Submit/Accept/Proceed)..."
-                                    )
-                                    time.sleep(0.04)
-
-                        elif state == "WAITING_FOR_DISMISSAL":
-                            # Button was clicked. We NEVER click it again while in this state.
-                            # We wait until it is confirmed dismissed before looking for the next button.
-                            time_since_click = now - last_click_time
-
-                            if target is not None:
-                                # Current button is still visible on screen
-                                absent_start_time = None
-                                consecutive_absent_frames = 0
-                                self.callback_on_status(
-                                    "RUNNING",
-                                    f"Prompt #{self.total_clicks} in progress • Waiting for button to dismiss..."
-                                )
-                                time.sleep(0.05)
-                            else:
-                                consecutive_absent_frames += 1
-                                if absent_start_time is None:
-                                    absent_start_time = now
-
-                                time_absent = now - absent_start_time
-
-                                # Confirm dismissal: sustained absence (>= 0.35s and >= 4 frames) + minimum cooldown
-                                if time_since_click >= 0.5 and (time_absent >= 0.35 or consecutive_absent_frames >= 4):
-                                    self.verified_target_cache = None
-                                    state = "WAITING_FOR_BUTTON"
-                                    button_first_seen_time = None
-                                    absent_frames_during_wait = 0
-                                    absent_start_time = None
-                                    consecutive_absent_frames = 0
-                                    self.callback_on_status(
-                                        "RUNNING",
-                                        f"Prompt #{self.total_clicks} completed • Waiting for NEXT button to appear..."
-                                    )
-                                else:
-                                    self.callback_on_status(
-                                        "RUNNING",
-                                        f"Prompt #{self.total_clicks} dismissing... ({consecutive_absent_frames} frames absent)"
-                                    )
                                 time.sleep(0.04)
+                                continue
+
+                            # Button is eligible: run latency countdown
+                            if button_first_seen_time is None:
+                                button_first_seen_time = now
+
+                            elapsed_seen = now - button_first_seen_time
+                            remaining_latency = max(0.0, self.click_latency - elapsed_seen)
+
+                            if remaining_latency > 0:
+                                self.callback_on_status(
+                                    "RUNNING",
+                                    f"Button '{kw.upper()}' locked! Waiting: {remaining_latency:.1f}s before click..."
+                                )
+                                time.sleep(0.04)
+                                continue
+
+                            # Latency elapsed -> DISPATCH CLICK!
+                            self.total_clicks += 1
+                            self._dispatch_click(screen_x, screen_y)
+
+                            if self.sound_enabled:
+                                threading.Thread(
+                                    target=self._play_click_sound, daemon=True
+                                ).start()
+
+                            last_click_time = time.time()
+                            last_click_pos = (screen_x, screen_y)
+                            was_absent = False
+                            button_first_seen_time = None
+                            self.verified_target_cache = None
+
+                            self.callback_on_status(
+                                "RUNNING",
+                                f"Clicked '{kw.upper()}'! [Click #{self.total_clicks}] • Ready for next"
+                            )
+
+                            self.callback_on_click(
+                                (screen_x, screen_y),
+                                self.total_clicks,
+                                (bx, by, bw, bh),
+                                (rw, rh),
+                            )
+
+                            time.sleep(0.12)
+                        else:
+                            # Button is not visible on screen
+                            was_absent = True
+                            button_first_seen_time = None
+                            if self.total_clicks > 0:
+                                self.callback_on_status(
+                                    "RUNNING",
+                                    f"Prompt #{self.total_clicks} done • Watching for NEXT button..."
+                                )
+                            else:
+                                self.callback_on_status(
+                                    "RUNNING",
+                                    "Watching for Button (Submit / Accept / Proceed)..."
+                                )
+                            time.sleep(0.04)
 
                     else:
                         # Continuous mode (if selected by user)

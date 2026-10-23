@@ -23,26 +23,41 @@ TARGET_KEYWORDS = ["submit", "accept all", "accept", "proceed"]
 def normalize_button_text(text):
     if not text:
         return ""
-    cleaned = re.sub(r'[^a-zA-Z0-9\s]', ' ', text.lower())
+    s = text.lower().replace("'", "").replace("’", "")
+    cleaned = re.sub(r'[^a-zA-Z0-9\s]', ' ', s)
     return ' '.join(cleaned.split())
 
 def match_target_button_keyword(text):
+    """
+    Strictly verifies whether text matches one of the target button keywords:
+    - 'submit'
+    - 'accept'
+    - 'accept all'
+    - 'proceed'
+    
+    Returns matched keyword string or None.
+    Rejects any negative phrasing ('do not accept', 'cannot submit', 'cancel', etc.).
+    """
     clean = normalize_button_text(text)
     if not clean:
         return None
 
-    if any(neg in clean for neg in ["not", "dont", "don't", "cancel", "decline", "reject", "close", "skip", "ignore"]):
-        return None
-
+    negatives = {"not", "dont", "no", "cancel", "decline", "reject", "close", "skip", "ignore", "never"}
     tokens = clean.split()
+    tokens_set = set(tokens)
+
+    if tokens_set.intersection(negatives):
+        return None
+    if any(neg in clean for neg in ["dont", "do not", "cannot", "cant"]):
+        return None
 
     if "accept all" in clean:
         return "accept all"
-    if "submit" in tokens or clean == "submit":
+    if "submit" in tokens_set or clean == "submit":
         return "submit"
-    if "proceed" in tokens or clean == "proceed":
+    if "proceed" in tokens_set or clean == "proceed":
         return "proceed"
-    if "accept" in tokens or clean == "accept":
+    if "accept" in tokens_set or clean == "accept":
         return "accept"
 
     for tok in tokens:
@@ -125,11 +140,7 @@ def dispatch_click(screen_x, screen_y):
         except Exception:
             pass
 
-    try:
-        time.sleep(0.04)
-        ctypes.windll.user32.SetCursorPos(int(screen_x), max(10, int(screen_y - 45)))
-    except Exception:
-        pass
+
 
 # Cached verified target: (bx, by, bw, bh, keyword, expire_time)
 _verified_cache = None
@@ -328,18 +339,14 @@ def main():
     if HAS_KEYBOARD:
         keyboard.on_press(on_stop)
 
-    STATE_WAITING_FOR_BUTTON = "WAITING_FOR_BUTTON"
-    STATE_WAITING_FOR_DISMISSAL = "WAITING_FOR_DISMISSAL"
-
     LATENCY_SECONDS = 2.0
+    RECLICK_COOLDOWN = 2.0
 
-    state = STATE_WAITING_FOR_BUTTON
     total_clicks = 0
     last_click_time = 0.0
+    last_click_pos = None
     button_first_seen_time = None
-    absent_frames_during_wait = 0
-    absent_start_time = None
-    consecutive_absent_frames = 0
+    was_absent = True
 
     sct_factory = getattr(mss, "MSS", mss.mss)
     with sct_factory() as sct:
@@ -360,73 +367,48 @@ def main():
 
                 target = find_blue_button(frame_bgr, tpl_gray, ocr_reader)
                 now = time.time()
+                time_since_click = now - last_click_time
 
-                if state == STATE_WAITING_FOR_BUTTON:
-                    if target is not None:
-                        cx, cy, kw = target
-                        screen_x = mon["left"] + cx
-                        screen_y = mon["top"] + cy
-                        absent_frames_during_wait = 0
+                if target is not None:
+                    cx, cy, kw = target
+                    screen_x = mon["left"] + cx
+                    screen_y = mon["top"] + cy
 
-                        if button_first_seen_time is None:
-                            button_first_seen_time = now
-                            print(f" [🎯] Button '{kw.upper()}' detected! Waiting {LATENCY_SECONDS:.1f}s latency before clicking...")
+                    is_different_pos = False
+                    if last_click_pos is not None:
+                        dist = ((screen_x - last_click_pos[0]) ** 2 + (screen_y - last_click_pos[1]) ** 2) ** 0.5
+                        if dist > 35:
+                            is_different_pos = True
 
-                        elapsed_seen = now - button_first_seen_time
-                        if elapsed_seen < LATENCY_SECONDS:
-                            time.sleep(0.04)
-                            continue
+                    is_eligible = was_absent or is_different_pos or (time_since_click >= RECLICK_COOLDOWN)
 
-                        # Strictly click ONCE when 2.0s latency has elapsed!
-                        total_clicks += 1
-                        print(f" [⚡] Latency elapsed ({LATENCY_SECONDS:.1f}s). Clicking ONCE at ({screen_x}, {screen_y}) | Prompt #{total_clicks}")
-                        dispatch_click(screen_x, screen_y)
-                        print("      Waiting for prompt to dismiss / next button to appear...")
-
-                        last_click_time = now
-                        button_first_seen_time = None
-                        absent_frames_during_wait = 0
-                        absent_start_time = None
-                        consecutive_absent_frames = 0
-                        state = STATE_WAITING_FOR_DISMISSAL
-                        time.sleep(0.15)
-                    else:
-                        if button_first_seen_time is not None:
-                            absent_frames_during_wait += 1
-                            if absent_frames_during_wait >= 8:
-                                button_first_seen_time = None
-                                absent_frames_during_wait = 0
-                            else:
-                                time.sleep(0.04)
-                                continue
+                    if not is_eligible:
                         time.sleep(0.04)
+                        continue
 
-                elif state == STATE_WAITING_FOR_DISMISSAL:
-                    # Button was clicked. We NEVER click it again while in this state.
-                    # We wait until it is confirmed dismissed before looking for the next button.
-                    time_since_click = now - last_click_time
+                    if button_first_seen_time is None:
+                        button_first_seen_time = now
+                        print(f" [🎯] Button '{kw.upper()}' detected! Waiting {LATENCY_SECONDS:.1f}s latency before click...")
 
-                    if target is not None:
-                        # Current button is still present on screen
-                        absent_start_time = None
-                        consecutive_absent_frames = 0
-                        time.sleep(0.05)
-                    else:
-                        consecutive_absent_frames += 1
-                        if absent_start_time is None:
-                            absent_start_time = now
-
-                        time_absent = now - absent_start_time
-
-                        # Confirm dismissal: sustained absence (>= 0.35s and >= 5 frames) + minimum cooldown
-                        if time_since_click >= 0.5 and (time_absent >= 0.35 or consecutive_absent_frames >= 5):
-                            _verified_cache = None
-                            state = STATE_WAITING_FOR_BUTTON
-                            button_first_seen_time = None
-                            absent_start_time = None
-                            consecutive_absent_frames = 0
-                            print(f" [⏳] Prompt #{total_clicks} dismissed. Ready & awaiting NEXT Submit button...")
+                    elapsed_seen = now - button_first_seen_time
+                    if elapsed_seen < LATENCY_SECONDS:
                         time.sleep(0.04)
+                        continue
+
+                    total_clicks += 1
+                    print(f" [⚡] Clicking '{kw.upper()}' ONCE at ({screen_x}, {screen_y}) | Prompt #{total_clicks}")
+                    dispatch_click(screen_x, screen_y)
+
+                    last_click_time = time.time()
+                    last_click_pos = (screen_x, screen_y)
+                    was_absent = False
+                    button_first_seen_time = None
+                    _verified_cache = None
+                    time.sleep(0.12)
+                else:
+                    was_absent = True
+                    button_first_seen_time = None
+                    time.sleep(0.04)
 
         except KeyboardInterrupt:
             pass
